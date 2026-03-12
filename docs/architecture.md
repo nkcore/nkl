@@ -112,11 +112,9 @@ src/
 
 - `NKL`
 - `NKL_PORT`
-- `NKL_APP_PORT`
 - `NKL_HTTPS`
 - `NKL_DOMAINS`
 - `NKL_STATE_DIR`
-- `NKL_SYNC_HOSTS`
 - `NKL_URL`
 
 ### Paths

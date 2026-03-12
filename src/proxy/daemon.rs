@@ -1,5 +1,6 @@
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
 
 use http_body_util::Full;
 use hyper::Request;
@@ -13,6 +14,77 @@ use super::server::{cleanup_lifecycle_files, start_proxy};
 // ---------------------------------------------------------------------------
 // Daemon
 // ---------------------------------------------------------------------------
+
+const STARTUP_LOCK_DIR: &str = "proxy.start.lock";
+const STARTUP_LOCK_MAX_RETRIES: u32 = 50;
+const STARTUP_LOCK_RETRY_DELAY: Duration = Duration::from_millis(100);
+const STARTUP_LOCK_STALE_THRESHOLD: Duration = Duration::from_secs(15);
+
+struct StartupLock {
+    path: PathBuf,
+}
+
+impl Drop for StartupLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn startup_lock_path(state_dir: &Path) -> PathBuf {
+    state_dir.join(STARTUP_LOCK_DIR)
+}
+
+fn lock_is_stale(path: &Path, stale_threshold: Duration) -> bool {
+    let modified = match fs::metadata(path).and_then(|meta| meta.modified()) {
+        Ok(mtime) => mtime,
+        Err(_) => return false,
+    };
+
+    match SystemTime::now().duration_since(modified) {
+        Ok(age) => age > stale_threshold,
+        Err(_) => false,
+    }
+}
+
+async fn acquire_startup_lock_with_params(
+    state_dir: &Path,
+    max_retries: u32,
+    retry_delay: Duration,
+    stale_threshold: Duration,
+) -> anyhow::Result<StartupLock> {
+    fs::create_dir_all(state_dir)?;
+
+    let lock_path = startup_lock_path(state_dir);
+
+    for _ in 0..max_retries {
+        match fs::create_dir(&lock_path) {
+            Ok(()) => return Ok(StartupLock { path: lock_path }),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                if lock_is_stale(&lock_path, stale_threshold) {
+                    let _ = fs::remove_dir_all(&lock_path);
+                    continue;
+                }
+                tokio::time::sleep(retry_delay).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+
+    anyhow::bail!(
+        "timed out waiting for proxy startup lock at {}",
+        lock_path.display()
+    )
+}
+
+async fn acquire_startup_lock(state_dir: &Path) -> anyhow::Result<StartupLock> {
+    acquire_startup_lock_with_params(
+        state_dir,
+        STARTUP_LOCK_MAX_RETRIES,
+        STARTUP_LOCK_RETRY_DELAY,
+        STARTUP_LOCK_STALE_THRESHOLD,
+    )
+    .await
+}
 
 /// Daemonize the current process and start the proxy.
 pub fn daemonize_and_start_proxy(config: &Config) -> anyhow::Result<()> {
@@ -53,6 +125,55 @@ pub fn daemonize_and_start_proxy(config: &Config) -> anyhow::Result<()> {
             Ok(())
         }
         Err(e) => anyhow::bail!("failed to daemonize: {}", e),
+    }
+}
+
+fn spawn_proxy_daemon_process(config: &Config) -> anyhow::Result<()> {
+    let exe = std::env::current_exe()?;
+
+    let mut args = vec![
+        "proxy".to_string(),
+        "start".to_string(),
+        "--daemonize".to_string(),
+        "--port".to_string(),
+        config.proxy_port.to_string(),
+    ];
+    if config.proxy_https {
+        args.push("--https".to_string());
+    }
+
+    std::process::Command::new(exe)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+
+    Ok(())
+}
+
+/// Ensure the proxy is running, serializing concurrent startup attempts.
+///
+/// Returns `Ok(true)` if this call started the proxy, `Ok(false)` if another
+/// process had already started it by the time the lock was acquired.
+pub async fn ensure_proxy_running(config: &Config) -> anyhow::Result<bool> {
+    let state_dir = config.resolve_state_dir();
+    let _lock = acquire_startup_lock(&state_dir).await?;
+
+    if is_proxy_running(config.proxy_port).await {
+        return Ok(false);
+    }
+
+    spawn_proxy_daemon_process(config)?;
+
+    let log_path = state_dir.join("proxy.log");
+    if wait_for_proxy(config.proxy_port, 20, 250).await {
+        Ok(true)
+    } else {
+        anyhow::bail!(
+            "proxy failed to start. Check logs at {}",
+            log_path.display()
+        );
     }
 }
 
@@ -298,5 +419,76 @@ mod tests {
 
         let result = show_logs(tmp.path(), false, None).await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn test_startup_lock_releases_on_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = startup_lock_path(tmp.path());
+
+        let lock = acquire_startup_lock_with_params(
+            tmp.path(),
+            1,
+            Duration::from_millis(1),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+        assert!(lock_path.exists());
+
+        drop(lock);
+        assert!(!lock_path.exists());
+    }
+
+    #[tokio::test]
+    async fn test_startup_lock_serializes_waiters() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = acquire_startup_lock_with_params(
+            tmp.path(),
+            1,
+            Duration::from_millis(1),
+            Duration::from_secs(60),
+        )
+        .await
+        .unwrap();
+
+        let path = tmp.path().to_path_buf();
+        let waiter = tokio::spawn(async move {
+            acquire_startup_lock_with_params(
+                &path,
+                20,
+                Duration::from_millis(5),
+                Duration::from_secs(60),
+            )
+            .await
+        });
+
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!waiter.is_finished());
+
+        drop(first);
+
+        let second = waiter.await.unwrap().unwrap();
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn test_startup_lock_reclaims_stale_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock_path = startup_lock_path(tmp.path());
+        fs::create_dir(&lock_path).unwrap();
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let lock = acquire_startup_lock_with_params(
+            tmp.path(),
+            2,
+            Duration::from_millis(1),
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+        assert!(lock_path.exists());
+        drop(lock);
     }
 }

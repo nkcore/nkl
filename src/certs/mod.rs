@@ -4,13 +4,13 @@ mod trust;
 
 pub use generate::{generate_ca, generate_host_cert, generate_server_cert};
 pub use sni::SniCertResolver;
-pub use trust::{TrustResult, is_ca_trusted, trust_ca};
+pub use trust::{TrustResult, trust_ca};
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use rcgen::{CertificateParams, KeyPair};
+use rcgen::{Issuer, KeyPair};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::sign::CertifiedKey;
 
@@ -120,16 +120,15 @@ pub fn ensure_certs(state_dir: &Path) -> anyhow::Result<CertPaths> {
 // Helper functions
 // ---------------------------------------------------------------------------
 
-/// Load a CA key pair and the signed CA certificate from PEM files on disk.
-pub(super) fn load_ca_keypair(state_dir: &Path) -> anyhow::Result<(KeyPair, rcgen::Certificate)> {
+/// Load the CA signer from PEM files on disk.
+pub(super) fn load_ca_keypair(state_dir: &Path) -> anyhow::Result<Issuer<'static, KeyPair>> {
     let key_pem = fs::read_to_string(state_dir.join(CA_KEY_FILE))?;
     let ca_key_pair = KeyPair::from_pem(&key_pem)?;
 
     let cert_pem = fs::read_to_string(state_dir.join(CA_CERT_FILE))?;
-    let ca_cert_params = CertificateParams::from_ca_cert_pem(&cert_pem)?;
-    let ca_cert = ca_cert_params.self_signed(&ca_key_pair)?;
+    let issuer = Issuer::from_ca_cert_pem(&cert_pem, ca_key_pair)?;
 
-    Ok((ca_key_pair, ca_cert))
+    Ok(issuer)
 }
 
 /// Load a certified key (cert chain + signing key) from PEM files.

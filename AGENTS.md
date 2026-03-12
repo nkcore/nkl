@@ -18,6 +18,7 @@ Use the `/pma` three-phase workflow:
 
 Documentation locations:
 
+- `README.md` -- usage guide
 - `docs/task/index.md` -- task index
 - `docs/plan/index.md` -- plan index
 - `docs/architecture.md` -- architecture document

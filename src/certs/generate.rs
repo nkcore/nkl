@@ -61,7 +61,7 @@ pub fn generate_ca(state_dir: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
 /// Generate a server certificate signed by the local CA. The cert covers
 /// `localhost` and `*.localhost`. Returns `(cert_path, key_path)`.
 pub fn generate_server_cert(state_dir: &Path) -> anyhow::Result<(PathBuf, PathBuf)> {
-    let (ca_key_pair, ca_cert) = load_ca_keypair(state_dir)?;
+    let ca_issuer = load_ca_keypair(state_dir)?;
 
     let server_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
 
@@ -83,7 +83,7 @@ pub fn generate_server_cert(state_dir: &Path) -> anyhow::Result<(PathBuf, PathBu
         .checked_add(time::Duration::days(SERVER_VALIDITY_DAYS as i64))
         .expect("server cert validity duration overflow");
 
-    let server_cert = params.signed_by(&server_key, &ca_cert, &ca_key_pair)?;
+    let server_cert = params.signed_by(&server_key, &ca_issuer)?;
 
     let cert_path = state_dir.join(SERVER_CERT_FILE);
     let key_path = state_dir.join(SERVER_KEY_FILE);
@@ -112,7 +112,7 @@ pub fn generate_host_cert(state_dir: &Path, hostname: &str) -> anyhow::Result<(P
     fs::create_dir_all(&host_dir)?;
     fix_ownership(&host_dir);
 
-    let (ca_key_pair, ca_cert) = load_ca_keypair(state_dir)?;
+    let ca_issuer = load_ca_keypair(state_dir)?;
 
     let host_key = KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)?;
 
@@ -140,7 +140,7 @@ pub fn generate_host_cert(state_dir: &Path, hostname: &str) -> anyhow::Result<(P
         .checked_add(time::Duration::days(SERVER_VALIDITY_DAYS as i64))
         .expect("server cert validity duration overflow");
 
-    let host_cert = params.signed_by(&host_key, &ca_cert, &ca_key_pair)?;
+    let host_cert = params.signed_by(&host_key, &ca_issuer)?;
 
     let safe_name = sanitize_hostname_for_filename(hostname);
     let cert_path = host_dir.join(format!("{}.pem", safe_name));

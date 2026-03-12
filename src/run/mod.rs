@@ -102,12 +102,8 @@ pub async fn run_app(
     };
 
     // Ensure proxy is running
-    if !crate::proxy::is_proxy_running(config.proxy_port).await {
-        tracing::info!("proxy not running, starting daemon...");
-        start_proxy_daemon(config)?;
-        if !crate::proxy::wait_for_proxy(config.proxy_port, 20, 250).await {
-            anyhow::bail!("failed to start proxy daemon");
-        }
+    if crate::proxy::ensure_proxy_running(config).await? {
+        tracing::info!("proxy not running, started daemon");
     }
 
     // Find a port for the app
@@ -160,7 +156,7 @@ async fn spawn_command(
 
     let shell_cmd = args.join(" ");
 
-    let mut wrap = TokioCommandWrap::with_new("sh", |command| {
+    let mut wrap = CommandWrap::with_new("sh", |command| {
         command
             .arg("-c")
             .arg(&shell_cmd)
@@ -199,7 +195,7 @@ async fn spawn_command(
         let mut sigterm =
             tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
-        let wait_fut = Box::into_pin(child.wait());
+        let wait_fut = child.wait();
 
         tokio::select! {
             status = wait_fut => {
@@ -208,12 +204,12 @@ async fn spawn_command(
             }
             _ = sigint.recv() => {
                 let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGTERM);
-                let status = Box::into_pin(child.wait()).await?;
+                let status = child.wait().await?;
                 propagate_exit_status(status);
             }
             _ = sigterm.recv() => {
                 let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGTERM);
-                let status = Box::into_pin(child.wait()).await?;
+                let status = child.wait().await?;
                 propagate_exit_status(status);
             }
         }
@@ -244,31 +240,6 @@ fn propagate_exit_status(status: std::process::ExitStatus) {
         }
         std::process::exit(1);
     }
-}
-
-/// Start the proxy as a daemon process.
-fn start_proxy_daemon(config: &Config) -> anyhow::Result<()> {
-    let exe = std::env::current_exe()?;
-
-    let mut args = vec![
-        "proxy".to_string(),
-        "start".to_string(),
-        "--daemonize".to_string(),
-        "--port".to_string(),
-        config.proxy_port.to_string(),
-    ];
-    if config.proxy_https {
-        args.push("--https".to_string());
-    }
-
-    std::process::Command::new(exe)
-        .args(&args)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()?;
-
-    Ok(())
 }
 
 #[cfg(test)]

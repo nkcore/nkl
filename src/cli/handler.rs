@@ -37,39 +37,10 @@ pub(super) async fn handle(cli: Cli) -> anyhow::Result<()> {
                 if daemonize {
                     crate::proxy::daemonize_and_start_proxy(&config)
                 } else if !foreground {
-                    if crate::proxy::is_proxy_running(config.proxy_port).await {
-                        println!("proxy is already running on port {}", config.proxy_port);
-                        return Ok(());
-                    }
-
-                    let exe = std::env::current_exe()?;
-                    let mut args = vec![
-                        "proxy".to_string(),
-                        "start".to_string(),
-                        "--daemonize".to_string(),
-                        "--port".to_string(),
-                        config.proxy_port.to_string(),
-                    ];
-                    if config.proxy_https {
-                        args.push("--https".to_string());
-                    }
-
-                    std::process::Command::new(exe)
-                        .args(&args)
-                        .stdin(std::process::Stdio::null())
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .spawn()?;
-
-                    let state_dir = config.resolve_state_dir();
-                    let log_path = state_dir.join("proxy.log");
-                    if crate::proxy::wait_for_proxy(config.proxy_port, 20, 250).await {
+                    if crate::proxy::ensure_proxy_running(&config).await? {
                         println!("proxy started on http://localhost:{}", config.proxy_port);
                     } else {
-                        anyhow::bail!(
-                            "proxy failed to start. Check logs at {}",
-                            log_path.display()
-                        );
+                        println!("proxy is already running on port {}", config.proxy_port);
                     }
                     Ok(())
                 } else {
@@ -196,11 +167,6 @@ pub(super) async fn handle(cli: Cli) -> anyhow::Result<()> {
                 Err(e) => {
                     anyhow::bail!("failed to generate certificates: {}", e);
                 }
-            }
-
-            if crate::certs::is_ca_trusted(&state_dir) {
-                println!("CA is already trusted by the system.");
-                return Ok(());
             }
 
             println!("installing CA into system trust store...");

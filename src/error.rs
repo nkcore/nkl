@@ -14,15 +14,6 @@ pub enum NKLError {
     #[error("failed to acquire route lock")]
     LockFailed,
 
-    #[error("hostname cannot be empty")]
-    EmptyHostname,
-
-    #[error("invalid hostname \"{0}\": {1}")]
-    InvalidHostname(String, String),
-
-    #[error("proxy not running")]
-    ProxyNotRunning,
-
     #[error(transparent)]
     Io(#[from] std::io::Error),
 

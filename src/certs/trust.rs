@@ -45,6 +45,10 @@ pub fn trust_ca(state_dir: &Path) -> anyhow::Result<TrustResult> {
         anyhow::bail!("CA certificate not found at {}", ca_cert_path.display());
     }
 
+    if is_ca_trusted(state_dir) {
+        return Ok(TrustResult::AlreadyTrusted);
+    }
+
     if cfg!(target_os = "macos") {
         trust_ca_macos(&ca_cert_path)
     } else {

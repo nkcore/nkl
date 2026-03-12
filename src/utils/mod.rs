@@ -134,12 +134,6 @@ pub fn parse_hostname(input: &str, domains: &[String]) -> Result<String, String>
     Ok(hostname)
 }
 
-/// Convenience wrapper using default domain `["localhost"]`.
-pub fn parse_hostname_default(input: &str) -> Result<String, String> {
-    let defaults = vec!["localhost".to_string()];
-    parse_hostname(input, &defaults)
-}
-
 /// Extract the hostname prefix (label before the domain suffix).
 ///
 /// For example, given hostname "myapp.localhost" and domains ["localhost", "dev.local"],

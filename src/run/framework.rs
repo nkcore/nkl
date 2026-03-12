@@ -144,7 +144,7 @@ pub async fn wait_for_app(
 pub async fn wait_for_app_wrapped(
     port: u16,
     timeout_secs: u64,
-    child: &mut Box<dyn process_wrap::tokio::TokioChildWrapper>,
+    child: &mut Box<dyn process_wrap::tokio::ChildWrapper>,
 ) -> anyhow::Result<()> {
     if timeout_secs == 0 {
         return Ok(());
