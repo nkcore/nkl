@@ -1,0 +1,275 @@
+mod framework;
+
+use crate::config::Config;
+use crate::discover::infer_project_name;
+use crate::routes::RouteStore;
+use crate::utils::{extract_hostname_prefix, format_url, format_urls, parse_hostname};
+
+use framework::{find_free_port, inject_framework_flags, wait_for_app_wrapped};
+
+/// Check if nkl proxy is disabled via the NKL environment variable.
+///
+/// Returns `true` when `NKL` is set to `"0"` or `"skip"` (case-insensitive).
+pub fn is_nkl_disabled() -> bool {
+    match std::env::var("NKL") {
+        Ok(val) => {
+            let v = val.trim().to_lowercase();
+            v == "0" || v == "skip"
+        }
+        Err(_) => false,
+    }
+}
+
+/// Spawn a command directly without proxy registration.
+async fn run_direct(config: &Config, cmd: &[String]) -> anyhow::Result<()> {
+    let port = config.app_port.unwrap_or(0);
+
+    tracing::info!(
+        "NKL env is set to skip; running command directly (PORT={})",
+        port
+    );
+
+    let shell_cmd = cmd.join(" ");
+    let status = tokio::process::Command::new("sh")
+        .arg("-c")
+        .arg(&shell_cmd)
+        .env("PORT", port.to_string())
+        .status()
+        .await?;
+
+    if !status.success() {
+        propagate_exit_status(status);
+    }
+
+    Ok(())
+}
+
+/// Print formatted connection info after app is ready.
+fn print_connection_info(
+    config: &Config,
+    cmd: &[String],
+    app_port: u16,
+    child_pid: u32,
+    hostname: &str,
+) {
+    let prefix = extract_hostname_prefix(hostname, &config.domains);
+    let urls = format_urls(
+        &prefix,
+        &config.domains,
+        config.proxy_port,
+        config.proxy_https,
+    );
+    let version = env!("CARGO_PKG_VERSION");
+
+    println!();
+    println!("nkl v{}", version);
+    println!();
+    println!("  App:     {}", cmd.join(" "));
+    println!("  Port:    {} (allocated)", app_port);
+    println!("  PID:     {}", child_pid);
+    println!();
+    println!("  URLs:");
+    for url in &urls {
+        println!("    {}", url);
+    }
+    println!();
+    println!(
+        "  Proxy:   http://127.0.0.1:{} (running)",
+        config.proxy_port
+    );
+    println!();
+    println!("  press ctrl+c to stop");
+    println!();
+}
+
+/// Run an app through the nkl proxy.
+pub async fn run_app(
+    config: &Config,
+    cmd: &[String],
+    name_override: Option<&str>,
+    change_origin: bool,
+) -> anyhow::Result<()> {
+    if is_nkl_disabled() {
+        return run_direct(config, cmd).await;
+    }
+
+    let hostname = if let Some(name) = name_override {
+        parse_hostname(name, &config.domains).map_err(|e| anyhow::anyhow!("{}", e))?
+    } else {
+        let cwd = std::env::current_dir()?;
+        let project_name = infer_project_name(&cwd);
+        parse_hostname(&project_name, &config.domains).map_err(|e| anyhow::anyhow!("{}", e))?
+    };
+
+    // Ensure proxy is running
+    if !crate::proxy::is_proxy_running(config.proxy_port).await {
+        tracing::info!("proxy not running, starting daemon...");
+        start_proxy_daemon(config)?;
+        if !crate::proxy::wait_for_proxy(config.proxy_port, 20, 250).await {
+            anyhow::bail!("failed to start proxy daemon");
+        }
+    }
+
+    // Find a port for the app
+    let app_port = match config.app_port {
+        Some(p) => p,
+        None => find_free_port(config.app_port_range.0, config.app_port_range.1)?,
+    };
+
+    // Register route
+    let state_dir = config.resolve_state_dir();
+    let store = RouteStore::new(state_dir);
+    let pid = std::process::id();
+    store.add_route(
+        &hostname,
+        app_port,
+        pid,
+        config.app_force,
+        change_origin,
+        "/",
+        false,
+    )?;
+
+    let url = format_url(&hostname, config.proxy_port, config.proxy_https);
+    tracing::info!("{} -> localhost:{}", url, app_port);
+
+    // Inject framework flags
+    let final_args = inject_framework_flags(cmd, app_port);
+
+    // Spawn the command with process group and await result
+    let result = spawn_command(&final_args, app_port, &url, config, cmd, &hostname).await;
+
+    // Cleanup route on exit
+    let state_dir = config.resolve_state_dir();
+    let store = RouteStore::new(state_dir);
+    let _ = store.remove_route(&hostname, None);
+
+    result
+}
+
+/// Spawn a child process in its own process group with signal forwarding.
+async fn spawn_command(
+    args: &[String],
+    port: u16,
+    url: &str,
+    config: &Config,
+    original_cmd: &[String],
+    hostname: &str,
+) -> anyhow::Result<()> {
+    use process_wrap::tokio::*;
+
+    let shell_cmd = args.join(" ");
+
+    let mut wrap = TokioCommandWrap::with_new("sh", |command| {
+        command
+            .arg("-c")
+            .arg(&shell_cmd)
+            .env("PORT", port.to_string())
+            .env("HOST", "127.0.0.1")
+            .env("NKL_URL", url);
+    });
+
+    wrap.wrap(ProcessGroup::leader());
+
+    let mut child = wrap.spawn()?;
+
+    let child_pid = child.id().unwrap_or(0);
+
+    // Wait for app readiness
+    if let Err(e) = wait_for_app_wrapped(port, config.ready_timeout, &mut child).await {
+        tracing::error!("readiness check failed: {}", e);
+        #[cfg(unix)]
+        {
+            let _ = nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(child_pid as i32),
+                nix::sys::signal::Signal::SIGTERM,
+            );
+        }
+        return Err(e);
+    }
+
+    // Print connection info
+    print_connection_info(config, original_cmd, port, child_pid, hostname);
+
+    // Set up signal forwarding and wait for child
+    #[cfg(unix)]
+    {
+        let pgid = nix::unistd::Pid::from_raw(child_pid as i32);
+        let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
+        let mut sigterm =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+        let wait_fut = Box::into_pin(child.wait());
+
+        tokio::select! {
+            status = wait_fut => {
+                let status = status?;
+                propagate_exit_status(status);
+            }
+            _ = sigint.recv() => {
+                let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGTERM);
+                let status = Box::into_pin(child.wait()).await?;
+                propagate_exit_status(status);
+            }
+            _ = sigterm.recv() => {
+                let _ = nix::sys::signal::killpg(pgid, nix::sys::signal::Signal::SIGTERM);
+                let status = Box::into_pin(child.wait()).await?;
+                propagate_exit_status(status);
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        let status = Box::into_pin(child.wait()).await?;
+        propagate_exit_status(status);
+    }
+
+    Ok(())
+}
+
+/// Propagate child exit status to the current process.
+fn propagate_exit_status(status: std::process::ExitStatus) {
+    if let Some(code) = status.code() {
+        if code != 0 {
+            std::process::exit(code);
+        }
+    } else {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            if let Some(sig) = status.signal() {
+                std::process::exit(128 + sig);
+            }
+        }
+        std::process::exit(1);
+    }
+}
+
+/// Start the proxy as a daemon process.
+fn start_proxy_daemon(config: &Config) -> anyhow::Result<()> {
+    let exe = std::env::current_exe()?;
+
+    let mut args = vec![
+        "proxy".to_string(),
+        "start".to_string(),
+        "--daemonize".to_string(),
+        "--port".to_string(),
+        config.proxy_port.to_string(),
+    ];
+    if config.proxy_https {
+        args.push("--https".to_string());
+    }
+
+    std::process::Command::new(exe)
+        .args(&args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests;

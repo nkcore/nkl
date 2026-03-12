@@ -1,0 +1,27 @@
+# Rust
+/target
+
+# logs
+*.log
+
+# dotenv
+.env
+.env.*
+
+# OS
+.DS_Store
+
+# IDEs
+.idea
+.vscode
+
+# Claude Code
+.claude.json
+.claude/
+
+# temp / reference
+tmp/
+
+# core dumps
+core
+core.*
